@@ -1,0 +1,244 @@
+{
+  "project": {
+    "name": "GENREG_MNIST_UBUNTU",
+    "description": "Evolutionary neural network for MNIST handwritten digit recognition using genetic regulatory networks (GENREG). Originally developed for Windows, ported to Ubuntu with GPU optimization.",
+    "platform": "Ubuntu Linux",
+    "language": "Python 3",
+    "frameworks": ["PyTorch", "Pygame", "NumPy", "Matplotlib"]
+  },
+  "version_control": {
+    "repository": "https://github.com/A1CST/GENREG_MNIST_UBUNTU.git",
+    "branch": "main",
+    "base_commit": {
+      "hash": "76a85ebf4b379539bdcca1930949eefde6e05065",
+      "short_hash": "76a85eb",
+      "author": "AsyncVibes",
+      "date": "2026-01-05T00:12:52-05:00",
+      "message": "Add files via upload"
+    }
+  },
+  "session_changes": {
+    "date": "2026-01-05",
+    "summary": "Ported from Windows to Ubuntu, added GPU pre-loading optimization, implemented data augmentation",
+    "modified_files": [
+      "genreg_mnist_bootstrap.py",
+      "genreg_visual_env.py",
+      "genreg_controller.py",
+      "config.py",
+      "blank_config.py"
+    ]
+  },
+  "files": {
+    "genreg_mnist_bootstrap.py": {
+      "purpose": "Main training loop for MNIST digit recognition. Entry point for the evolutionary training process.",
+      "changes": [
+        {
+          "type": "bugfix",
+          "description": "Fixed Windows multiprocessing spawn issue for Ubuntu compatibility",
+          "location": "lines 41-49",
+          "before": "mp.set_start_method('spawn', force=True) unconditionally",
+          "after": "Platform-aware check: only set spawn on Windows (sys.platform == 'win32')"
+        },
+        {
+          "type": "optimization",
+          "description": "GPU-batched image loading - pre-selects all images for generation at once",
+          "location": "lines 586-592",
+          "details": "Uses env.prepare_generation_batch() to pre-load all images to GPU before inner loop"
+        },
+        {
+          "type": "optimization",
+          "description": "Reduced pygame rendering frequency from every image to every 3rd digit",
+          "location": "lines 640-643"
+        },
+        {
+          "type": "feature",
+          "description": "Added augmentation info to startup display",
+          "location": "line 527"
+        }
+      ]
+    },
+    "genreg_visual_env.py": {
+      "purpose": "Visual environments including MNISTEnv for digit recognition. Handles image loading, rendering, and observation generation.",
+      "changes": [
+        {
+          "type": "optimization",
+          "description": "GPU pre-loading of all 60,000 MNIST images at startup",
+          "location": "lines 911-932 (_preload_to_gpu method)",
+          "details": "Creates gpu_images tensor (60000, 784) and gpu_images_by_digit dict for O(1) access"
+        },
+        {
+          "type": "optimization",
+          "description": "Batch observation getter for multiple images at once",
+          "location": "lines 962-979 (get_batch_observations_gpu method)"
+        },
+        {
+          "type": "optimization",
+          "description": "Optimized pygame rendering with numpy surfarray instead of pixel-by-pixel loops",
+          "location": "lines 1196-1218 (_render_field method)"
+        },
+        {
+          "type": "feature",
+          "description": "Random Resized Crop augmentation - crops 50-80% and resizes back",
+          "location": "lines 985-1024 (_aug_random_resized_crop method)",
+          "purpose": "Forces model to recognize digits from partial views"
+        },
+        {
+          "type": "feature",
+          "description": "Random Affine augmentation - rotation (+-10-25 deg) and translation (+-4px)",
+          "location": "lines 1026-1077 (_aug_random_affine method)",
+          "purpose": "Creates spatial invariance"
+        },
+        {
+          "type": "feature",
+          "description": "Gaussian Blur/Noise augmentation",
+          "location": "lines 1079-1112 (_aug_gaussian_blur_noise method)",
+          "purpose": "Removes high-frequency details, forces learning of shape over texture"
+        },
+        {
+          "type": "feature",
+          "description": "Updated prepare_generation_batch with augmentation strategy",
+          "location": "lines 1133-1194",
+          "details": "5 heavy augmented, 5 shifted, 10 original per digit"
+        }
+      ]
+    },
+    "genreg_controller.py": {
+      "purpose": "Neural network controller with batched GPU operations for parallel genome evaluation.",
+      "changes": [
+        {
+          "type": "optimization",
+          "description": "forward_visual_all_digits now accepts GPU tensors directly without conversion",
+          "location": "lines 804-836",
+          "details": "Checks if input is already a torch.Tensor on correct device, skips conversion"
+        }
+      ]
+    },
+    "config.py": {
+      "purpose": "Global configuration for all training parameters, network architecture, and augmentation settings.",
+      "changes": [
+        {
+          "type": "feature",
+          "description": "Added data augmentation configuration section",
+          "location": "lines 192-194",
+          "settings": {
+            "MNIST_SHIFT_RATIO": 0.5,
+            "MNIST_MAX_SHIFT": 3
+          }
+        }
+      ]
+    },
+    "blank_config.py": {
+      "purpose": "Configuration for visual field/alphabet recognition mode (not MNIST).",
+      "changes": []
+    },
+    "genreg_genome.py": {
+      "purpose": "Genome representation and population management for evolutionary algorithm.",
+      "changes": []
+    },
+    "genreg_proteins.py": {
+      "purpose": "Protein cascade system for genetic regulatory network dynamics.",
+      "changes": []
+    },
+    "genreg_checkpoint.py": {
+      "purpose": "Checkpoint save/load functionality for training persistence.",
+      "changes": []
+    },
+    "mnist_eval.py": {
+      "purpose": "Standalone evaluation script for trained MNIST genomes on test set.",
+      "changes": []
+    },
+    "mnist_inference.py": {
+      "purpose": "Interactive inference tool - draw digits and test genome predictions.",
+      "changes": []
+    },
+    "mnist_embedding_viz.py": {
+      "purpose": "Visualization of hidden layer embeddings using t-SNE/PCA.",
+      "changes": []
+    }
+  },
+  "architecture": {
+    "neural_network": {
+      "input_size": 784,
+      "hidden_size": 16,
+      "output_size": 10,
+      "activation": "tanh"
+    },
+    "evolutionary": {
+      "population_size": 500,
+      "selection": "trust-based",
+      "mutation": "weight perturbation"
+    },
+    "training": {
+      "images_per_digit": 20,
+      "digits_per_episode": 10,
+      "correct_reward": 10.0,
+      "wrong_penalty": -2.5
+    }
+  },
+  "augmentation_strategy": {
+    "per_digit_distribution": {
+      "heavy_augmented": 5,
+      "shifted": 5,
+      "original": 10,
+      "total": 20
+    },
+    "heavy_augmentation_types": [
+      {
+        "name": "Random Resized Crop",
+        "description": "Crop 50-80% of image, resize to 28x28",
+        "purpose": "Learn from partial digit views"
+      },
+      {
+        "name": "Random Affine",
+        "description": "Rotation +-10-25 degrees, translation +-4 pixels",
+        "purpose": "Spatial invariance"
+      },
+      {
+        "name": "Gaussian Blur/Noise",
+        "description": "3x3 blur kernel or Gaussian noise (sigma 0.05-0.15)",
+        "purpose": "Focus on shape over texture"
+      }
+    ],
+    "shift_augmentation": {
+      "max_pixels": 3,
+      "direction": "random x and y"
+    }
+  },
+  "performance_optimizations": {
+    "gpu_preloading": {
+      "description": "All 60,000 MNIST images pre-loaded to GPU at startup",
+      "memory": "~180 MB GPU",
+      "benefit": "Zero CPU-GPU transfer during training"
+    },
+    "batched_inference": {
+      "description": "All genomes evaluated in single GPU call per image",
+      "gpu_calls_per_generation": 200
+    },
+    "reduced_rendering": {
+      "description": "Pygame renders only every 3rd digit instead of every image",
+      "reduction": "~85% fewer render calls"
+    },
+    "surfarray_rendering": {
+      "description": "Uses numpy surfarray instead of pixel-by-pixel set_at()",
+      "benefit": "Vectorized rendering operations"
+    }
+  },
+  "dependencies": {
+    "required": [
+      "torch",
+      "torchvision",
+      "pygame",
+      "numpy",
+      "matplotlib"
+    ],
+    "optional": [
+      "scipy"
+    ]
+  },
+  "usage": {
+    "training": "python genreg_mnist_bootstrap.py",
+    "evaluation": "python mnist_eval.py",
+    "inference": "python mnist_inference.py",
+    "visualization": "python mnist_embedding_viz.py"
+  }
+}

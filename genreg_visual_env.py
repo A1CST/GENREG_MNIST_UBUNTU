@@ -815,6 +815,8 @@ class MNISTEnv:
     No partial credit, pure pattern → digit mapping.
 
     Downloads MNIST automatically via torchvision if not present.
+
+    GPU OPTIMIZATION: Pre-loads all images to GPU for fast batched access.
     """
 
     def __init__(self, render_mode="human", device="cuda"):
@@ -854,10 +856,14 @@ class MNISTEnv:
         # Organize images by digit for balanced sampling
         self._organize_by_digit()
 
+        # GPU OPTIMIZATION: Pre-load all images to GPU
+        self._preload_to_gpu()
+
         # Current state
         self.current_digit = None
         self.current_digit_idx = 0
         self.current_image = None
+        self.current_image_idx = None  # Track which image index for GPU lookup
         self.digit_order = list(range(10))
 
         # Statistics
@@ -902,6 +908,29 @@ class MNISTEnv:
             count = len(self.images_by_digit[digit])
             print(f"  Digit {digit}: {count} images")
 
+    def _preload_to_gpu(self):
+        """Pre-load ALL MNIST images to GPU as a single tensor for fast access."""
+        print(f"[MNIST] Pre-loading all images to {self.device}...")
+
+        n_images = len(self.mnist_data)
+
+        # Stack all images into a single tensor (N, 784) on GPU
+        all_images = []
+        for idx in range(n_images):
+            image, _ = self.mnist_data[idx]
+            all_images.append(image.view(-1))  # Flatten to 784
+
+        # Stack and move to GPU
+        self.gpu_images = self.torch.stack(all_images).to(self.device)
+
+        # Also create per-digit GPU tensors for even faster sampling
+        self.gpu_images_by_digit = {}
+        for digit in range(10):
+            indices = self.images_by_digit[digit]
+            self.gpu_images_by_digit[digit] = self.gpu_images[indices]
+
+        print(f"[MNIST] GPU tensor shape: {self.gpu_images.shape} ({self.gpu_images.element_size() * self.gpu_images.nelement() / 1024 / 1024:.1f} MB)")
+
     def reset(self):
         """Reset for new episode - shuffle digit order."""
         random.shuffle(self.digit_order)
@@ -913,38 +942,280 @@ class MNISTEnv:
         """Select a random MNIST image of the given digit."""
         self.current_digit = str(digit_idx)
 
-        # Pick a random image of this digit
-        available_images = self.images_by_digit[digit_idx]
-        random_idx = random.choice(available_images)
+        # Pick a random image index within this digit's images
+        n_images = len(self.images_by_digit[digit_idx])
+        local_idx = random.randint(0, n_images - 1)
 
-        # Get the image tensor
-        image_tensor, label = self.mnist_data[random_idx]
+        # Store for GPU lookup
+        self.current_digit_int = digit_idx
+        self.current_local_idx = local_idx
 
-        # Convert to numpy for pygame rendering (28x28)
-        self.current_image = image_tensor.squeeze().numpy()
+        # Get from GPU tensor for observation (stays on GPU until needed)
+        self.current_image = self.gpu_images_by_digit[digit_idx][local_idx].cpu().numpy().reshape(28, 28)
 
         self.observation_dirty = True
 
+    def get_observation_gpu(self):
+        """Get current observation as GPU tensor (no CPU conversion)."""
+        return self.gpu_images_by_digit[self.current_digit_int][self.current_local_idx]
+
+    def get_batch_observations_gpu(self, digit_idx, n_images):
+        """
+        Get multiple random images of a digit directly as GPU tensor.
+
+        Args:
+            digit_idx: which digit (0-9)
+            n_images: how many images to sample
+
+        Returns:
+            torch.Tensor of shape (n_images, 784) on GPU
+        """
+        digit_images = self.gpu_images_by_digit[digit_idx]
+        n_available = digit_images.shape[0]
+
+        # Random sample indices
+        indices = self.torch.randint(0, n_available, (n_images,), device=self.device)
+
+        return digit_images[indices]
+
+    # ================================================================
+    # AUGMENTATION METHODS
+    # ================================================================
+
+    def _aug_random_resized_crop(self, image):
+        """
+        Random Resized Crop - crop 50-80% of image and resize back to 28x28.
+        Forces model to recognize digits from partial views.
+
+        Args:
+            image: tensor of shape (784,) - flattened 28x28 image
+
+        Returns:
+            Augmented image tensor of shape (784,)
+        """
+        img_2d = image.view(28, 28)
+
+        # Random crop size (50-80% of original)
+        crop_ratio = random.uniform(0.5, 0.8)
+        crop_size = int(28 * crop_ratio)
+
+        # Random crop position
+        max_offset = 28 - crop_size
+        crop_x = random.randint(0, max_offset)
+        crop_y = random.randint(0, max_offset)
+
+        # Extract crop
+        crop = img_2d[crop_y:crop_y + crop_size, crop_x:crop_x + crop_size]
+
+        # Resize back to 28x28 using nearest neighbor (simple but fast)
+        # Use repeat to upscale
+        scale = 28 / crop_size
+        if scale > 1:
+            # Upscale using interpolation
+            crop_np = crop.cpu().numpy()
+            # Simple bilinear-ish resize using numpy
+            y_indices = np.clip((np.arange(28) / scale).astype(int), 0, crop_size - 1)
+            x_indices = np.clip((np.arange(28) / scale).astype(int), 0, crop_size - 1)
+            resized = crop_np[np.ix_(y_indices, x_indices)]
+            result = self.torch.from_numpy(resized).float().to(self.device)
+        else:
+            result = crop
+
+        return result.view(784)
+
+    def _aug_random_affine(self, image):
+        """
+        Random Affine - rotation (±15-30°) and translation (10-20%).
+        Creates spatial invariance.
+
+        Args:
+            image: tensor of shape (784,) - flattened 28x28 image
+
+        Returns:
+            Augmented image tensor of shape (784,)
+        """
+        img_2d = image.view(28, 28).cpu().numpy()
+
+        # Random rotation (±15 to ±30 degrees, but not too extreme for digits)
+        angle = random.choice([-1, 1]) * random.uniform(10, 25)
+
+        # Random translation (10-20% of image size = 2-5 pixels)
+        tx = random.randint(-4, 4)
+        ty = random.randint(-4, 4)
+
+        # Create rotation matrix
+        angle_rad = np.radians(angle)
+        cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+
+        # Center of image
+        cx, cy = 14, 14
+
+        # Apply affine transform
+        result = np.zeros((28, 28), dtype=np.float32)
+
+        for y in range(28):
+            for x in range(28):
+                # Translate to center, rotate, translate back, then apply shift
+                src_x = cos_a * (x - cx) + sin_a * (y - cy) + cx - tx
+                src_y = -sin_a * (x - cx) + cos_a * (y - cy) + cy - ty
+
+                # Bilinear interpolation
+                x0, y0 = int(np.floor(src_x)), int(np.floor(src_y))
+                x1, y1 = x0 + 1, y0 + 1
+
+                if 0 <= x0 < 27 and 0 <= y0 < 27:
+                    fx, fy = src_x - x0, src_y - y0
+                    result[y, x] = (
+                        img_2d[y0, x0] * (1 - fx) * (1 - fy) +
+                        img_2d[y0, x1] * fx * (1 - fy) +
+                        img_2d[y1, x0] * (1 - fx) * fy +
+                        img_2d[y1, x1] * fx * fy
+                    )
+                elif 0 <= x0 < 28 and 0 <= y0 < 28:
+                    result[y, x] = img_2d[y0, x0]
+
+        return self.torch.from_numpy(result).float().to(self.device).view(784)
+
+    def _aug_gaussian_blur_noise(self, image):
+        """
+        Gaussian Blur or Noise - removes high-frequency details.
+        Forces model to learn shape, not texture artifacts.
+
+        Args:
+            image: tensor of shape (784,) - flattened 28x28 image
+
+        Returns:
+            Augmented image tensor of shape (784,)
+        """
+        img_2d = image.view(28, 28)
+
+        # Randomly choose blur or noise
+        if random.random() < 0.5:
+            # Gaussian blur using simple 3x3 kernel
+            img_np = img_2d.cpu().numpy()
+            kernel = np.array([[1, 2, 1], [2, 4, 2], [1, 2, 1]], dtype=np.float32) / 16.0
+
+            # Pad and convolve
+            padded = np.pad(img_np, 1, mode='constant', constant_values=0)
+            result = np.zeros_like(img_np)
+
+            for y in range(28):
+                for x in range(28):
+                    result[y, x] = np.sum(padded[y:y+3, x:x+3] * kernel)
+
+            return self.torch.from_numpy(result).float().to(self.device).view(784)
+        else:
+            # Add Gaussian noise
+            noise_std = random.uniform(0.05, 0.15)
+            noise = self.torch.randn_like(image) * noise_std
+            noisy = (image + noise).clamp(0, 1)
+            return noisy
+
+    def _apply_random_augmentation(self, image):
+        """
+        Apply a randomly selected augmentation to a single image.
+
+        Args:
+            image: tensor of shape (784,)
+
+        Returns:
+            Augmented image tensor of shape (784,)
+        """
+        aug_type = random.randint(0, 2)
+
+        if aug_type == 0:
+            return self._aug_random_resized_crop(image)
+        elif aug_type == 1:
+            return self._aug_random_affine(image)
+        else:
+            return self._aug_gaussian_blur_noise(image)
+
+    def prepare_generation_batch(self, images_per_digit, shift_ratio=0.5, max_shift=3):
+        """
+        Pre-select all images for an entire generation with augmentation.
+
+        Augmentation strategy:
+        - 10 images (half): shifted by a few pixels (simple augmentation)
+        - 5 images (quarter): random heavy augmentation (crop/affine/blur)
+        - 5 images (quarter): unmodified originals
+
+        Args:
+            images_per_digit: number of images per digit
+            shift_ratio: fraction of images to shift (default 0.5 = half)
+            max_shift: maximum pixels to shift in any direction (default 3)
+
+        Returns:
+            dict mapping digit -> tensor of shape (images_per_digit, 784) on GPU
+        """
+        batch = {}
+        n_heavy_aug = 5  # 5 images get heavy augmentation (crop/affine/blur)
+        n_shift = int(images_per_digit * shift_ratio) - n_heavy_aug  # Remaining shifted
+
+        for digit in range(10):
+            images = self.get_batch_observations_gpu(digit, images_per_digit)
+
+            # Shuffle indices to randomly select which images get which augmentation
+            all_indices = list(range(images_per_digit))
+            random.shuffle(all_indices)
+
+            # First n_heavy_aug get heavy augmentation
+            heavy_indices = all_indices[:n_heavy_aug]
+            # Next n_shift get simple shift
+            shift_indices = all_indices[n_heavy_aug:n_heavy_aug + n_shift]
+            # Rest stay unmodified
+
+            # Apply heavy augmentations (crop/affine/blur)
+            for idx in heavy_indices:
+                images[idx] = self._apply_random_augmentation(images[idx])
+
+            # Apply simple shifts
+            for idx in shift_indices:
+                shift_x = random.randint(-max_shift, max_shift)
+                shift_y = random.randint(-max_shift, max_shift)
+                if shift_x != 0 or shift_y != 0:
+                    img_2d = images[idx].view(28, 28)
+                    shifted = self.torch.zeros_like(img_2d)
+
+                    src_x_start = max(0, -shift_x)
+                    src_x_end = min(28, 28 - shift_x)
+                    dst_x_start = max(0, shift_x)
+                    dst_x_end = min(28, 28 + shift_x)
+                    src_y_start = max(0, -shift_y)
+                    src_y_end = min(28, 28 - shift_y)
+                    dst_y_start = max(0, shift_y)
+                    dst_y_end = min(28, 28 + shift_y)
+
+                    shifted[dst_y_start:dst_y_end, dst_x_start:dst_x_end] = \
+                        img_2d[src_y_start:src_y_end, src_x_start:src_x_end]
+
+                    images[idx] = shifted.view(784)
+
+            batch[digit] = images
+        return batch
+
     def _render_field(self):
-        """Render the current MNIST digit on the display."""
+        """Render the current MNIST digit on the display (optimized with surfarray)."""
         # Clear screen
         self.screen.fill((0, 0, 0))
 
-        if self.current_image is not None:
-            # Scale MNIST 28x28 to display size (100x100)
-            # Create a pygame surface from the MNIST image
-            mnist_surface = pygame.Surface((self.mnist_width, self.mnist_height))
+        if self.current_image is not None and NUMPY_AVAILABLE:
+            # OPTIMIZED: Use numpy and surfarray instead of pixel-by-pixel
+            # Simple nearest-neighbor scaling with numpy (no scipy needed)
+            # Repeat each pixel to scale from 28x28 to ~112x112, then crop to 100x100
+            scale_factor = 4  # 28 * 4 = 112
+            scaled_image = np.repeat(np.repeat(self.current_image, scale_factor, axis=0), scale_factor, axis=1)
+            # Crop to exact display size
+            scaled_image = scaled_image[:self.display_height, :self.display_width]
 
-            # Fill the surface with the MNIST image (grayscale -> RGB)
-            for y in range(self.mnist_height):
-                for x in range(self.mnist_width):
-                    # MNIST values are 0-1, convert to 0-255
-                    intensity = int(self.current_image[y, x] * 255)
-                    mnist_surface.set_at((x, y), (intensity, intensity, intensity))
+            # Convert to 0-255 and create RGB array (pygame expects W, H, 3)
+            rgb_array = (scaled_image * 255).astype(np.uint8)
+            rgb_array = np.stack([rgb_array, rgb_array, rgb_array], axis=-1)
 
-            # Scale to display size
-            scaled = pygame.transform.scale(mnist_surface, (self.display_width, self.display_height))
-            self.screen.blit(scaled, (0, 0))
+            # Transpose for pygame (expects width, height, 3)
+            rgb_array = np.transpose(rgb_array, (1, 0, 2))
+
+            # Blit directly using surfarray
+            pygame.surfarray.blit_array(self.screen, rgb_array)
 
         if self.render_mode == "human":
             pygame.display.flip()

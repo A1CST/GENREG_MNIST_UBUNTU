@@ -806,13 +806,21 @@ class BatchedController:
         Run visual forward pass for ALL controllers for MNIST digit recognition.
 
         obs: single observation vector (all genomes see the same image)
+              Can be a list, numpy array, or GPU tensor
         returns: digit_probs tensor of shape (n_controllers, 10)
         """
-        # Convert observation to tensor and expand to batch
-        if isinstance(obs, list):
+        # Convert observation to tensor (optimized for GPU tensors)
+        if isinstance(obs, torch.Tensor):
+            # Already a tensor - just ensure it's on the right device
+            if obs.device != self.device:
+                obs_tensor = obs.to(self.device)
+            else:
+                obs_tensor = obs
+        elif isinstance(obs, list):
             obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device)
         else:
-            obs_tensor = obs.to(self.device)
+            # Assume numpy array
+            obs_tensor = torch.from_numpy(obs).float().to(self.device)
 
         # Expand obs to (n_controllers, input_size) - all same input
         inputs = obs_tensor.unsqueeze(0).expand(self.n_controllers, -1)

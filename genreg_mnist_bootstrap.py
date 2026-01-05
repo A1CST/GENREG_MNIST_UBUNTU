@@ -38,9 +38,15 @@ if PYGAME_AVAILABLE:
 # Multiprocessing for charts (avoid pygame/matplotlib GIL conflict)
 import multiprocessing as mp
 
-# Fix Windows multiprocessing spawn issues
+# Platform-aware multiprocessing start method
+# Windows needs 'spawn' to avoid resource conflicts; Linux/macOS use default 'fork' (more efficient)
 if __name__ == "__main__":
-    mp.set_start_method('spawn', force=True)
+    import sys
+    if sys.platform == 'win32':
+        try:
+            mp.set_start_method('spawn', force=True)
+        except RuntimeError:
+            pass  # Start method already set
 
 
 # ================================================================
@@ -518,6 +524,7 @@ def mnist_bootstrap_loop(session_config):
     print(f"  Output size:  {output_size} (digit probs 0-9)")
     print(f"  Hidden size:  {hidden_size}")
     print(f"  GPU:          {'Yes (' + str(DEVICE) + ')' if TORCH_AVAILABLE and DEVICE else 'No (CPU)'}")
+    print(f"  Augmentation: 5 heavy (crop/affine/blur), 5 shifted, 10 original")
     print("=" * 70)
     print("\nTask: See a handwritten digit, output that digit.")
     print("Reward: +10 correct, -1.5 wrong (no partial credit)")
@@ -562,7 +569,7 @@ def mnist_bootstrap_loop(session_config):
                 continue
 
             # ========================================
-            # EVALUATE ALL GENOMES (BATCHED)
+            # EVALUATE ALL GENOMES (GPU-BATCHED)
             # ========================================
             gen_correct = 0
             gen_attempts = 0
@@ -577,37 +584,46 @@ def mnist_bootstrap_loop(session_config):
             if cfg.MNIST_RANDOMIZE_ORDER:
                 random.shuffle(digit_order)
 
-            # BATCHED: For each digit, show multiple images and evaluate ALL genomes
+            # GPU OPTIMIZATION: Pre-select ALL images for this generation at once
+            # With random shift augmentation (half the images shifted by a few pixels)
+            gen_images = env.prepare_generation_batch(
+                cfg.MNIST_IMAGES_PER_DIGIT,
+                shift_ratio=cfg.MNIST_SHIFT_RATIO,
+                max_shift=cfg.MNIST_MAX_SHIFT
+            )
+
+            # SUPER-BATCHED: Process all images for each digit
             for digit_pos, digit_idx in enumerate(digit_order):
                 expected = str(digit_idx)
 
-                # Show multiple images of this digit for more stable signal
+                # Handle pygame events once per digit (not per image)
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+                    if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                        running = False
+
+                if not running:
+                    break
+
+                # Get all images for this digit (already on GPU)
+                digit_images = gen_images[digit_idx]  # (n_images, 784) GPU tensor
+
+                # Progress indicator
+                print(f"\r  Digit {digit_pos+1}/10 ({expected}), Images 1-{cfg.MNIST_IMAGES_PER_DIGIT}...", end="", flush=True)
+
+                # Process all images for this digit
                 for image_num in range(cfg.MNIST_IMAGES_PER_DIGIT):
-                    # Handle events
-                    for event in pygame.event.get():
-                        if event.type == pygame.QUIT:
-                            running = False
-                        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                            running = False
-
-                    if not running:
-                        break
-
-                    # Select a NEW random image of this digit
-                    env._select_digit(digit_idx)
-                    obs = env.get_observation()
-
-                    # Render the digit
-                    env.render()
-
-                    # Progress indicator
-                    print(f"\r  Digit {digit_pos+1}/10 ({expected}), Image {image_num+1}/{cfg.MNIST_IMAGES_PER_DIGIT}...", end="", flush=True)
+                    # Get single image (already on GPU as tensor)
+                    obs_gpu = digit_images[image_num]  # (784,) GPU tensor
 
                     if batched:
                         # ONE GPU call: Get predictions from ALL genomes for this image
-                        digits = batched.generate_digit_all(obs)
+                        # Pass GPU tensor directly (no list conversion!)
+                        digits = batched.generate_digit_all(obs_gpu)
                     else:
-                        # Fallback: Sequential evaluation
+                        # Fallback: Sequential evaluation (needs CPU list)
+                        obs = obs_gpu.cpu().tolist()
                         digits = [g.controller.generate_digit(obs) for g in population.genomes]
 
                     # Evaluate all predictions
@@ -627,8 +643,10 @@ def mnist_bootstrap_loop(session_config):
                         else:
                             genome.trust += cfg.MNIST_WRONG_PENALTY
 
-                if not running:
-                    break
+                # Render ONCE per digit (for visual feedback, not per image)
+                if digit_pos % 3 == 0:  # Only render every 3rd digit
+                    env._select_digit(digit_idx)  # Update display image
+                    env.render()
 
             if not running:
                 break

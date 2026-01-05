@@ -187,11 +187,7 @@ MNIST_WRONG_PENALTY = -2.5           # Penalty for wrong digit
 MNIST_DIGITS_PER_EPISODE = 10        # Show all 10 digits per episode
 MNIST_IMAGES_PER_DIGIT = 20          # Images shown per digit per generation (more = stable signal)
 MNIST_RANDOMIZE_ORDER = True         # Shuffle digit order each episode
-MNIST_CHECKPOINT_INTERVAL = 500      # Save checkpoint every N generations
-
-# ----- Data Augmentation -----
-MNIST_SHIFT_RATIO = 0.5              # Fraction of images to shift (0.5 = half)
-MNIST_MAX_SHIFT = 3                  # Maximum pixels to shift in any direction
+MNIST_CHECKPOINT_INTERVAL = 500     # Save checkpoint every N generations
 
 
 # ================================================================
